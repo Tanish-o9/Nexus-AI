@@ -1,0 +1,96 @@
+name: CD — Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+  packages: write  # Necessary to push packages to GitHub Container Registry (GHCR)
+
+jobs:
+  # ── 1. Build and Push Stage (Matrix builds services in parallel) ──
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, ai-service, ml-service, frontend]
+        include:
+          - service: backend
+            context: ./backend
+            dockerfile: ./docker/Dockerfile.backend.prod
+            image: ghcr.io/${{ github.repository }}/backend
+          - service: ai-service
+            context: ./ai-service
+            dockerfile: ./docker/Dockerfile.ai.prod
+            image: ghcr.io/${{ github.repository }}/ai-service
+          - service: ml-service
+            context: ./ml-service
+            dockerfile: ./docker/Dockerfile.ml.prod
+            image: ghcr.io/${{ github.repository }}/ml-service
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./docker/Dockerfile.frontend.prod
+            image: ghcr.io/${{ github.repository }}/frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: actions/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker Tag
+        id: meta
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "env=prod" >> $GITHUB_OUTPUT
+          else
+            echo "tag=staging" >> $GITHUB_OUTPUT
+            echo "env=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and Push Service Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ matrix.image }}:${{ steps.meta.outputs.tag }}
+            ${{ matrix.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 2. Deploy Stage (Staging / Production Promotion) ──
+  deploy:
+    name: Deploy to Cloud Environment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Determine Environment
+        id: env_name
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "target=production" >> $GITHUB_OUTPUT
+          else
+            echo "target=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy Hook (AWS ECS/EKS placeholder)
+        run: |
+          echo "Connecting to Cloud Provider..."
+          echo "Target Environment: ${{ steps.env_name.outputs.target }}"
+          echo "Pulling Docker Image Tag: ${{ github.sha }}..."
+          echo "Triggering Rolling Update on Kubernetes cluster / ECS Service Task definitions..."
+          echo "Deployment process completed successfully!"

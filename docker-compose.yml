@@ -1,0 +1,271 @@
+version: '3.8'
+
+services:
+  # ── 1. PostgreSQL Database with pgvector Capability ──
+  db:
+    image: ankane/pgvector:v0.5.1
+    container_name: nexus_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${DB_NAME:-nexus_db}
+      POSTGRES_USER: ${DB_USER:-nexus_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-nexus_secure_password_replace_me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-nexus_user} -d ${DB_NAME:-nexus_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── PgBouncer Connection Pooler ──
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: nexus_pgbouncer
+    restart: always
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini
+      - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt
+    environment:
+      - DB_USER=${DB_USER:-nexus_user}
+      - DB_PASSWORD=${DB_PASSWORD:-nexus_secure_password_replace_me}
+      - DB_HOST=db
+      - DB_PORT=5432
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 6432"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 2. Redis Cache & Messaging Queue ──
+  redis:
+    image: redis:7.2-alpine
+    container_name: nexus_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 3. Elasticsearch Document indexing engine ──
+  elasticsearch:
+    image: elasticsearch:8.11.3
+    container_name: nexus_elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 4. Django REST Backend ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/Dockerfile.backend.dev
+    container_name: nexus_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      - DEBUG=${DEBUG:-true}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-dev-secret-key-change-me}
+      - POSTGRES_DB=${DB_NAME:-nexus_db}
+      - POSTGRES_USER=${DB_USER:-nexus_user}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-nexus_secure_password_replace_me}
+      - POSTGRES_HOST=pgbouncer
+      - POSTGRES_PORT=6432
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/admin/\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 5. AI Service (FastAPI + LangChain) ──
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: ../docker/Dockerfile.ai.dev
+    container_name: nexus_ai_service
+    restart: always
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ai-service:/app
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-mock-key-for-development}
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER:-nexus_user}:${DB_PASSWORD:-nexus_secure_password_replace_me}@pgbouncer:6432/${DB_NAME:-nexus_db}
+      - REDIS_URL=redis://redis:6379/1
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8001/health/live\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 6. ML Service (FastAPI Recommendation Inference) ──
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: ../docker/Dockerfile.ml.dev
+    container_name: nexus_ml_service
+    restart: always
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./ml-service:/app
+    environment:
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:-change-me-in-prod}
+      - BACKEND_URL=http://backend:8000
+      - MODELS_DIR=models
+      - MODEL_VERSION=v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8002/health\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # ── 7. Client Web Application (Next.js) ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend.dev
+    container_name: nexus_frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules # Prevents node_modules from being overwritten by local mount
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_AI_SERVICE_URL=${NEXT_PUBLIC_AI_SERVICE_URL:-http://localhost:8001}
+      - NEXT_PUBLIC_ML_SERVICE_URL=${NEXT_PUBLIC_ML_SERVICE_URL:-http://localhost:8002}
+    depends_on:
+      backend:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+      ml-service:
+        condition: service_healthy
+    networks:
+      - nexus-network
+
+  # ── 8. Prometheus Metrics Scraper ──
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: nexus_prometheus
+    restart: always
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      backend:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+      ml-service:
+        condition: service_healthy
+    networks:
+      - nexus-network
+
+  # ── 9. Grafana Telemetry Dashboard ──
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: nexus_grafana
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./docker/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - nexus-network
+
+  # ── 10. Certbot SSL Certificate Renewer ──
+  certbot:
+    image: certbot/certbot:v2.8.0
+    container_name: nexus_certbot
+    restart: always
+    volumes:
+      - ./docker/nginx/ssl:/etc/letsencrypt
+      - ./docker/nginx/certbot-webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - nexus-network
+
+volumes:
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
+  es_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  nexus-network:
+    driver: bridge
